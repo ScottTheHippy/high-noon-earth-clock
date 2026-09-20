@@ -103,6 +103,9 @@ Edit these near the top of `HighNoonEarthClock.ino`: `LOCAL_TZ` (timezone),
 | `C` | play the chime |
 | `S` | dump a screenshot frame (used by `tools/screenshot.py`) |
 
+Serial output never blocks (`setTxTimeoutMs(0)`), so the clock runs smoothly with
+nothing reading the port; there is no periodic debug output.
+
 Enter Wi-Fi without leaving the password in shell history:
 
 ```sh

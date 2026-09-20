@@ -219,7 +219,7 @@ void renderGlobe(uint16_t *dst, double unix_s) {
       uint16_t col = (r << 11) | (g << 5) | b;
       dcol[i * SCR] = a == 255 ? col : blend565(0, col, a);
     }
-    if ((j & 31) == 31) vTaskDelay(1);
+    if ((j & 7) == 7) vTaskDelay(pdMS_TO_TICKS(10));  // gentle slices: keeps the display loop smooth
   }
   drawTwelveMark(dst);
 }
@@ -230,9 +230,7 @@ void globeTask(void *) {
     if (pending) continue;
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    uint32_t t0 = millis();
     renderGlobe(bases[1 - front], (double)tv.tv_sec + tv.tv_usec * 1e-6);
-    Serial.printf("globe render %lu ms\n", (unsigned long)(millis() - t0));
     pending = true;
   }
 }
@@ -489,6 +487,7 @@ void drawBell(bool on, int alpha) {
 
 void setup() {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);  // never stall the display when nothing is reading the port
   i2cLock = xSemaphoreCreateMutex();
   setenv("TZ", LOCAL_TZ, 1);
   tzset();
@@ -565,7 +564,6 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastFps = 0, frames = 0;
   handleSerial();
   if (pending) {
     front = 1 - front;
@@ -633,19 +631,15 @@ void loop() {
     const size_t total = (size_t)SCR * SCR * 2;
     uint32_t hdr[2] = {0x544F4853u, (uint32_t)total};
     Serial.write((const uint8_t *)hdr, sizeof(hdr));
-    for (size_t off = 0; off < total;) {
+    uint32_t giveUp = millis() + 3000;
+    for (size_t off = 0; off < total && millis() < giveUp;) {
       size_t n = Serial.write((const uint8_t *)fb + off, min((size_t)4096, total - off));
       off += n;
-      if (!n) delay(1);
+      if (n) giveUp = millis() + 3000;
+      else delay(1);
     }
   }
 
   canvas->flush();
 
-  frames++;
-  if (nowMs - lastFps >= 5000) {
-    Serial.printf("%.1f fps\n", frames * 1000.0f / (nowMs - lastFps));
-    frames = 0;
-    lastFps = nowMs;
-  }
 }
