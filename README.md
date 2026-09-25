@@ -11,10 +11,36 @@ small orange dot marks 12 o'clock. The hands are Swiss-railway style: flat white
 bars for hours and minutes, and a red second hand ending in a disc.
 
 Tap the screen to switch a soft hourly double chirp on or off (a bell icon
-confirms). It runs on the **Waveshare ESP32-S3-Touch-AMOLED-1.75** (466x466 round
+confirms); press and hold for 2 seconds to set up Wi-Fi from your phone. It runs on the **Waveshare ESP32-S3-Touch-AMOLED-1.75** (466x466 round
 AMOLED, 16 MB flash, 8 MB PSRAM).
 
 This screenshot is a real frame grab from the device (`tools/screenshot.py`).
+
+## Wi-Fi and time setup
+
+The board has a clock chip (RTC), but it only keeps time while the board has power, so
+after an unplug the time is lost. The clock therefore reads the time from an internet
+time server (NTP) every time it starts and every 6 hours, then turns Wi-Fi off again.
+Until it has done that after a power loss it shows a **"Time not set"** warning instead
+of guessing.
+
+<p align="center"><img src="docs/setup_screen.png" width="300" alt="The Wi-Fi setup screen: a QR code, the network name, and a tap-to-cancel hint"></p>
+
+You set up Wi-Fi and the timezone **from your phone, no computer needed**:
+
+1. On first start (or after pressing and holding the screen for 2 seconds) the clock
+   shows the screen above and starts a temporary open Wi-Fi network,
+   `Earth-Clock-Setup`.
+2. Scan the QR code with your phone's camera, or join that network by hand.
+3. A setup page opens by itself (or browse to `192.168.4.1`). Pick your network, enter
+   the password, choose your timezone, and tap Connect.
+4. The clock joins your network, reads the time, saves your settings, and switches back
+   to the clock face. A tap on the screen cancels setup at any time; it also closes
+   itself after 10 minutes.
+
+Daylight saving changes need no Wi-Fi: the timezone you pick contains its DST rule
+(for example US Pacific switches on the second Sunday of March and the first Sunday of
+November), and the clock applies it on its own. The time server only supplies UTC.
 
 ## How it works
 
@@ -44,13 +70,28 @@ shadowed hands and the bell with a small software anti-aliased line/bar
 rasterizer, and push the frame over QSPI at about 10 fps. The second hand sweeps
 continuously from the microsecond clock.
 
-**Time.** At boot the system clock is set from the board's PCF85063 RTC. If you
-give it Wi-Fi credentials it also syncs over NTP at boot and every 6 hours, writes
-the result back to the RTC, and turns Wi-Fi off. Time can also be set over serial.
-The timezone is a POSIX TZ string compiled in (`LOCAL_TZ`), so DST is handled.
+**Time.** At boot the system clock is set from the board's PCF85063 RTC when the
+chip says its time is valid (its oscillator-stop flag is clear); otherwise the time is
+marked untrusted. A background task then joins the saved Wi-Fi, asks the NTP pool
+(`pool.ntp.org`, Google, Cloudflare), sets the system clock, writes the RTC, and turns
+Wi-Fi off. Failed attempts are retried with a growing delay (15 s up to 15 minutes),
+and a successful sync is repeated every 6 hours. Everything is stored as UTC and
+converted with the saved POSIX timezone string (`LOCAL_TZ` is only the default), which
+is why DST needs no network.
+
+**Wi-Fi setup portal.** With no Wi-Fi saved, or on request, the clock runs a soft AP
+plus a tiny DNS server that answers every name with the clock's own address, so phones
+treat it as a captive portal and open the setup page. A QR code (`WIFI:` format, made
+with the ESP32 core's built-in generator) lets a phone join the AP with one scan. The
+page is served by the core's `WebServer`. When you submit it, the clock tries the
+network and the time server while its own AP stays up, and the page polls `/status`
+because some phones drop the AP for a moment when the radio changes channel. The
+settings are saved only after the time server has answered, so a mistyped password is
+reported instead of silently saved. All of this is in `clock_net.h`.
 
 **Touch and chime.** A task polls the CST9217 touch controller. A short, barely
-moving touch is a tap, which toggles the chime (stored in flash). The chime is
+moving touch is a tap, which toggles the chime (stored in flash); holding still for
+2 seconds starts Wi-Fi setup. The chime is
 two 100 ms rising chirps synthesized in code, played through the ES8311 codec
 over I2S with the speaker amplifier enabled only while it sounds.
 
@@ -90,33 +131,42 @@ with: 16 MB flash, OPI PSRAM, USB CDC on boot, and the 8 MB app partition from
 override in the script is needed because the board menu's size check does not
 read `partitions.csv`.
 
-Edit these near the top of `HighNoonEarthClock.ino`: `LOCAL_TZ` (timezone),
+Edit these near the top of `HighNoonEarthClock.ino`: `LOCAL_TZ` (the default timezone
+until you choose one in the phone setup), `SETUP_AP_SSID` (the setup network's name),
 `CHIME_VOLUME` (0-100, roughly 5 dB per 10), `GLOBE_UPDATE_MS`.
 
 ## Serial commands (115200 baud)
 
 | Command | Effect |
 |---|---|
-| `T<unix epoch>` | set the clock and RTC, e.g. `T1789883133` |
+| `T<unix epoch>` | set the clock and RTC by hand, e.g. `T1789883133` |
 | `W<ssid><TAB><password>` | save Wi-Fi in flash and sync time now |
 | `X` | forget saved Wi-Fi |
+| `Z<POSIX TZ>` | set the timezone, e.g. `ZPST8PDT,M3.2.0,M11.1.0` |
+| `P` | start the phone Wi-Fi setup |
+| `?` | print the time source, timezone, Wi-Fi name and last sync |
 | `C` | play the chime |
 | `S` | dump a screenshot frame (used by `tools/screenshot.py`) |
 
 Serial output never blocks (`setTxTimeoutMs(0)`), so the clock runs smoothly with
 nothing reading the port; there is no periodic debug output.
 
-Enter Wi-Fi without leaving the password in shell history:
+The phone setup is easier, but you can also enter Wi-Fi over USB. Opening the serial
+port resets the board, so wait for it to boot before sending or the line is lost. On
+macOS/Linux with zsh this keeps the password out of your shell history:
 
 ```sh
-read "s?Wi-Fi name: "; read -s "p?Password: "; echo; printf 'W%s\t%s\n' "$s" "$p" > /dev/cu.usbmodemXXXX
+read "s?Wi-Fi name: "; read -s "p?Password: "; echo; exec 3<>/dev/cu.usbmodemXXXX; stty 115200 <&3; sleep 4; printf 'W%s\t%s\n' "$s" "$p" >&3; sleep 2; exec 3>&-; echo sent
 ```
 
 ## Limitations and ideas
 
-- Wi-Fi is set over USB serial and the timezone is compiled in. A phone-based
-  setup page (temporary access point with a QR code on screen) would make it
-  shareable.
+- The setup network is open (no password), and your Wi-Fi password crosses it once, over
+  the air, in plain HTTP. It is up only during setup (at most 10 minutes) and only
+  within Wi-Fi range, but anyone nearby at that moment could in principle see it. If that
+  matters, use the serial command above instead.
+- The timezone list in the setup page covers common zones. Others can be set with the
+  `Z` serial command using a POSIX TZ string.
 - Only the sunlit hemisphere is ever shown by design, so there are no city lights.
 - Chime quiet hours would be a natural addition.
 
@@ -126,9 +176,13 @@ read "s?Wi-Fi name: "; read -s "p?Password: "; echo; printf 'W%s\t%s\n' "$s" "$p
   and Shaded Topography*. Fetched by `tools/build.sh`, not stored in the repo.
 - `es8311.c`, `es8311.h`, `es8311_reg.h`: Espressif ES8311 driver (Apache-2.0), as
   shipped in Waveshare's example for this board.
+- Fonts in `fonts/`: the FreeSans headers from the Adafruit GFX Library, which are
+  derived from [GNU FreeFont](https://www.gnu.org/software/freefont/) (GPL with the
+  font-embedding exception). One `#include` line was removed from each.
 - Libraries: [GFX Library for Arduino](https://github.com/moononournation/Arduino_GFX),
   [SensorLib](https://github.com/lewisxhe/SensorLib).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The bundled ES8311 driver files are Apache-2.0.
+MIT, see [LICENSE](LICENSE). The bundled ES8311 driver files are Apache-2.0, and the
+fonts are derived from GNU FreeFont (see Credits).

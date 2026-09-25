@@ -22,3 +22,4 @@ SOFTWARE.
 
 Third-party files keep their own licenses: es8311.c, es8311.h and es8311_reg.h
 are Apache-2.0 (Espressif Systems).
+The fonts in fonts/ are derived from GNU FreeFont; see README.md.

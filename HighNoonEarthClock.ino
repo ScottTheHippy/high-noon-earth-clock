@@ -3,6 +3,7 @@
 // with the day. Waveshare ESP32-S3-Touch-AMOLED-1.75 (466x466, CO5300 QSPI).
 // Build: FQBN esp32:esp32:esp32s3 with PSRAM=opi, FlashSize=16M, custom partitions.csv (8MB app).
 // Regenerate the texture header with tools/bake_tex.py.
+// Wi-Fi, NTP time sync, timezone and the phone setup portal live in clock_net.h.
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include <math.h>
@@ -11,6 +12,10 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <esp_sntp.h>
+#include "qrcode.h"
+#include "fonts/FreeSansBold18pt7b.h"
+#include "fonts/FreeSansBold12pt7b.h"
+#include "fonts/FreeSans9pt7b.h"
 #include <ESP_I2S.h>
 #include "TouchDrvCSTXXX.hpp"
 #include "es8311.h"
@@ -51,7 +56,8 @@ extern "C" const uint8_t earth_tex_start[];
 #define GLOBE_R 233
 #define GLOBE_N (2 * GLOBE_R)
 #define GLOBE_OFF (SCR / 2 - GLOBE_R)
-#define LOCAL_TZ "PST8PDT,M3.2.0,M11.1.0"
+#define LOCAL_TZ "PST8PDT,M3.2.0,M11.1.0"  // default until you pick one in the phone setup
+#define SETUP_AP_SSID "Earth-Clock-Setup"
 #define RTC_ADDR 0x51
 #define GLOBE_UPDATE_MS 15000
 
@@ -301,83 +307,56 @@ time_t buildTime() {
   return mktime(&t);
 }
 
-// ---- Wi-Fi time sync: joins, sets the clock over NTP, writes the RTC, turns Wi-Fi off ----
-TaskHandle_t syncTaskHandle;
+#include "clock_net.h"
 
-bool syncOverNtp(const String &ssid, const String &pass) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(500));
-  bool ok = false;
-  if (WiFi.status() == WL_CONNECTED) {
-    configTzTime(LOCAL_TZ, "pool.ntp.org", "time.google.com", "time.nist.gov");
-    for (int i = 0; i < 30 && !ok; i++) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      ok = sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED;
-    }
-    if (ok) writeRTC(time(nullptr));
-    esp_sntp_stop();
-  }
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  return ok;
-}
-
-void syncTask(void *) {
-  vTaskDelay(pdMS_TO_TICKS(3000));
-  for (;;) {
-    Preferences prefs;
-    prefs.begin("wifi", true);
-    String ssid = prefs.getString("ssid", ""), pass = prefs.getString("pass", "");
-    prefs.end();
-    if (ssid.length()) {
-      bool ok = syncOverNtp(ssid, pass);
-      Serial.println(ok ? "ntp: time synced" : "ntp: sync failed (check Wi-Fi name/password)");
-    }
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(6UL * 3600UL * 1000UL));
-  }
-}
-
-// Serial commands (115200): S dump a screenshot; C play the chime; T<unix-epoch> set time;  W<ssid><TAB><password> save Wi-Fi
-// and sync now;  X forget Wi-Fi.
+// Serial (115200): S screenshot; C chime; T<epoch> set time; W<ssid><TAB><password> save Wi-Fi; X forget Wi-Fi;
+// Z<posix tz> set timezone; P start Wi-Fi setup; ? status.
 void handleSerial() {
   static String line;
   while (Serial.available()) {
     char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (line.length() > 1 && line[0] == 'T') {
-        time_t t = (time_t)line.substring(1).toInt();
-        if (t > 1700000000) {
-          setSystemTime(t);
-          writeRTC(t);
-          Serial.printf("time set to %ld\n", (long)t);
-        }
-      } else if (line.length() > 1 && line[0] == 'W') {
-        int tab = line.indexOf('\t');
-        if (tab > 1) {
-          Preferences prefs;
-          prefs.begin("wifi", false);
-          prefs.putString("ssid", line.substring(1, tab));
-          prefs.putString("pass", line.substring(tab + 1));
-          prefs.end();
-          Serial.printf("wifi saved for '%s', syncing\n", line.substring(1, tab).c_str());
-          if (syncTaskHandle) xTaskNotifyGive(syncTaskHandle);
-        }
-      } else if (line == "S") {
-        shotRequested = true;
-      } else if (line == "C") {
-        if (chimeTaskHandle) xTaskNotifyGive(chimeTaskHandle);
-      } else if (line == "X") {
-        Preferences prefs;
-        prefs.begin("wifi", false);
-        prefs.clear();
-        prefs.end();
-        Serial.println("wifi cleared");
-      }
-      line = "";
-    } else if (line.length() < 160) {
-      line += c;
+    if (c != '\n' && c != '\r') {
+      if (line.length() < 160) line += c;
+      continue;
     }
+    if (line.length() > 1 && line[0] == 'T') {
+      time_t t = (time_t)line.substring(1).toInt();
+      if (t > 1700000000) {
+        setSystemTime(t);
+        writeRTC(t);
+        lastSyncEpoch = t;
+        timeSource = TS_SYNCED;
+        Serial.printf("time set to %ld\n", (long)t);
+      }
+    } else if (line.length() > 1 && line[0] == 'W') {
+      int tab = line.indexOf('\t');
+      if (tab > 1) {
+        saveCreds(line.substring(1, tab), line.substring(tab + 1));
+        Serial.printf("wifi saved for '%s', syncing\n", line.substring(1, tab).c_str());
+        if (netTaskHandle) xTaskNotifyGive(netTaskHandle);
+      }
+    } else if (line.length() > 1 && line[0] == 'Z') {
+      String tz = line.substring(1);
+      saveTz(tz);
+      applyTz(tz);
+      Serial.printf("timezone set to %s\n", tz.c_str());
+    } else if (line == "P") {
+      setupRequested = true;
+      if (netTaskHandle) xTaskNotifyGive(netTaskHandle);
+    } else if (line == "S") {
+      shotRequested = true;
+    } else if (line == "C") {
+      if (chimeTaskHandle) xTaskNotifyGive(chimeTaskHandle);
+    } else if (line == "X") {
+      saveCreds("", "");
+      Serial.println("wifi cleared");
+    } else if (line == "?") {
+      String ssid, pass;
+      bool have = loadCreds(ssid, pass);
+      Serial.printf("time source %d (0 none, 1 rtc, 2 synced), tz %s, wifi %s, last sync %ld, now %ld\n", (int)timeSource,
+                    tzString.c_str(), have ? ssid.c_str() : "(none)", (long)lastSyncEpoch, (long)time(nullptr));
+    }
+    line = "";
   }
 }
 
@@ -433,10 +412,10 @@ void chimeTask(void *) {
   }
 }
 
-// A tap is a short touch that barely moves. Release is declared after 100 ms without a touch report.
+// A tap is a short touch that barely moves (toggles the chime); holding still for 2 s starts Wi-Fi setup.
 void touchTask(void *) {
   int16_t xs[2], ys[2];
-  bool down = false;
+  bool down = false, longFired = false;
   uint32_t downAt = 0, lastSeen = 0, lastTap = 0;
   int16_t sx = 0, sy = 0;
   int moved = 0;
@@ -452,16 +431,23 @@ void touchTask(void *) {
       lastSeen = now;
       if (!down) {
         down = true;
+        longFired = false;
         downAt = now;
         sx = xs[0];
         sy = ys[0];
         moved = 0;
       } else {
         moved = max(moved, abs(xs[0] - sx) + abs(ys[0] - sy));
+        if (!longFired && moved < 60 && now - downAt > 2000 && !setupActive) {
+          longFired = true;
+          setupRequested = true;
+          if (netTaskHandle) xTaskNotifyGive(netTaskHandle);
+          Serial.println("long press: wifi setup");
+        }
       }
     } else if (down && now - lastSeen > 100) {
       down = false;
-      if (lastSeen - downAt < 700 && moved < 60 && now - lastTap > 350) {
+      if (!longFired && lastSeen - downAt < 700 && moved < 60 && now - lastTap > 350) {
         lastTap = now;
         tapFlag = true;
         Serial.println("tap");
@@ -485,12 +471,77 @@ void drawBell(bool on, int alpha) {
   }
 }
 
+static void printCenter(const GFXfont *f, int cx, int y, uint16_t col, const char *s) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  canvas->setFont(f);
+  canvas->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  canvas->setTextColor(col);
+  canvas->setCursor(cx - (int)w / 2 - x1, y);
+  canvas->print(s);
+}
+
+static void qrDraw(esp_qrcode_handle_t qr) {
+  const int n = esp_qrcode_get_size(qr);
+  int mod = 259 / (n + 8);  // 4-module quiet zone on each side
+  if (mod < 3) mod = 3;
+  const int box = (n + 8) * mod, x0 = 233 - box / 2, y0 = 82;
+  canvas->fillRect(x0, y0, box, box, 0xFFFF);
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; x++)
+      if (esp_qrcode_get_module(qr, x, y)) canvas->fillRect(x0 + (x + 4) * mod, y0 + (y + 4) * mod, mod, mod, 0x0000);
+}
+
+static void drawSetupScreen() {
+  canvas->fillScreen(0x0000);
+  printCenter(&FreeSansBold18pt7b, 233, 60, 0xFFFF, "Wi-Fi setup");
+  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+  cfg.display_func = qrDraw;
+  cfg.max_qrcode_version = 6;
+  esp_qrcode_generate(&cfg, "WIFI:T:nopass;S:" SETUP_AP_SSID ";;");
+
+  const char *l1, *l2;
+  uint16_t c1 = 0xFFFF;
+  switch (setupStatus) {
+    case 1: l1 = "Phone connected"; l2 = "Fill in the setup page"; break;
+    case 2: l1 = "Connecting..."; l2 = "Joining Wi-Fi, reading time"; break;
+    case 3: l1 = "All set!"; l2 = "The time is synced"; c1 = 0x07E0; break;
+    case 4: l1 = "Could not connect"; l2 = "Try again on your phone"; c1 = 0xFD20; break;
+    default: l1 = "Scan with your phone"; l2 = "or join " SETUP_AP_SSID; break;
+  }
+  printCenter(&FreeSansBold12pt7b, 233, 380, c1, l1);
+  printCenter(&FreeSans9pt7b, 233, 406, 0xFFFF, l2);
+  printCenter(&FreeSans9pt7b, 233, 432, 0x8410, "Tap to cancel");
+}
+
+// Shown over the clock whenever the time has not been set from a trusted source.
+static void drawTimeWarning() {
+  if (timeSource != TS_NONE) return;
+  aaBar(fb, 110, 404, 356, 404, 30, 0x0000, 190);
+  printCenter(&FreeSansBold12pt7b, 233, 400, 0xFD20, "Time not set");
+  printCenter(&FreeSans9pt7b, 233, 424, 0xFFFF, "Hold to set up Wi-Fi");
+}
+
+static void sendShotIfRequested() {
+  if (!shotRequested) return;  // raw RGB565 frame: "SHOT", byte count, pixels (see tools/screenshot.py)
+  shotRequested = false;
+  const size_t total = (size_t)SCR * SCR * 2;
+  uint32_t hdr[2] = {0x544F4853u, (uint32_t)total};
+  Serial.write((const uint8_t *)hdr, sizeof(hdr));
+  uint32_t giveUp = millis() + 3000;
+  for (size_t off = 0; off < total && millis() < giveUp;) {
+    size_t n = Serial.write((const uint8_t *)fb + off, min((size_t)4096, total - off));
+    off += n;
+    if (n) giveUp = millis() + 3000;
+    else delay(1);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // never stall the display when nothing is reading the port
   i2cLock = xSemaphoreCreateMutex();
-  setenv("TZ", LOCAL_TZ, 1);
-  tzset();
+  applyTz(loadTz());
 
   if (!gfx->begin()) Serial.println("gfx begin failed");
   gfx->setBrightness(190);
@@ -514,14 +565,17 @@ void setup() {
   time_t t;
   if (readRTC(&t)) {
     setSystemTime(t);
+    timeSource = TS_RTC;
     Serial.println("time from RTC");
   } else {
-    setSystemTime(buildTime());
-    Serial.println("RTC invalid, using build time - send T<epoch> over serial");
+    setSystemTime(buildTime());  // only a starting guess; the clock says "Time not set" until Wi-Fi syncs it
+    timeSource = TS_NONE;
+    Serial.println("RTC invalid: time not set until a Wi-Fi sync");
   }
 
   canvas = new Arduino_Canvas(SCR, SCR, gfx, 0, 0);
   canvas->begin(GFX_SKIP_OUTPUT_BEGIN);
+  canvas->setRotation(1);  // upright text; matches the hand/globe drawing rotation
   fb = canvas->getFramebuffer();
   bases[0] = (uint16_t *)ps_malloc(SCR * SCR * 2);
   bases[1] = (uint16_t *)ps_malloc(SCR * SCR * 2);
@@ -558,13 +612,30 @@ void setup() {
   renderGlobe(bases[0], (double)tv.tv_sec + tv.tv_usec * 1e-6);
   front = 0;
   xTaskCreatePinnedToCore(globeTask, "globe", 8192, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(syncTask, "sync", 8192, NULL, 1, &syncTaskHandle, 0);
+  xTaskCreatePinnedToCore(netTask, "net", 12288, NULL, 1, &netTaskHandle, 0);
   xTaskCreatePinnedToCore(chimeTask, "chime", 8192, NULL, 1, &chimeTaskHandle, 0);
   xTaskCreatePinnedToCore(touchTask, "touch", 4096, NULL, 2, NULL, 0);
 }
 
 void loop() {
   handleSerial();
+  if (setupActive) {
+    static int lastStatus = -1;
+    static uint32_t lastDraw = 0;
+    if (tapFlag) {
+      tapFlag = false;
+      setupCancel = true;
+    }
+    if (lastStatus != setupStatus || millis() - lastDraw > 2000) {
+      drawSetupScreen();
+      canvas->flush();
+      lastStatus = setupStatus;
+      lastDraw = millis();
+    }
+    sendShotIfRequested();
+    delay(40);
+    return;
+  }
   if (pending) {
     front = 1 - front;
     pending = false;
@@ -626,19 +697,8 @@ void loop() {
     if (chimeEnabled && lt.tm_min == 0 && lt.tm_sec < 5 && chimeTaskHandle) xTaskNotifyGive(chimeTaskHandle);
   }
 
-  if (shotRequested) {  // raw RGB565 frame: "SHOT", byte count, pixels (see tools/screenshot.py)
-    shotRequested = false;
-    const size_t total = (size_t)SCR * SCR * 2;
-    uint32_t hdr[2] = {0x544F4853u, (uint32_t)total};
-    Serial.write((const uint8_t *)hdr, sizeof(hdr));
-    uint32_t giveUp = millis() + 3000;
-    for (size_t off = 0; off < total && millis() < giveUp;) {
-      size_t n = Serial.write((const uint8_t *)fb + off, min((size_t)4096, total - off));
-      off += n;
-      if (n) giveUp = millis() + 3000;
-      else delay(1);
-    }
-  }
+  drawTimeWarning();
+  sendShotIfRequested();
 
   canvas->flush();
 
